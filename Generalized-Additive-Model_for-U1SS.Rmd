@@ -16,7 +16,7 @@ Expected input files in `data/`:
 - `nearest_10_U1_sites_by_gene.RData`: the output from
   `Find_top-n_nearest_U1sites_publication.R`, containing
   `nearest_U1sitelist`.
-- `down1000_sense_score0 or more.txt`: tab-delimited U1SS summary data.
+- `u1_summary_down500_sense_maxentscore_higherthan0.txt`: tab-delimited U1SS summary data.
 - `rna_tissue_consensus.tsv`: Human Protein Atlas tissue-expression data.
 
 Set the `U1SS_DATA_DIR` or `U1SS_RESULTS_DIR` environment variable to use a
@@ -49,7 +49,7 @@ dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
 
 input_files <- c(
   nearest_u1_sites = file.path(data_dir, "nearest_10_U1_sites_by_gene.RData"),
-  u1_summary = file.path(data_dir, "down1000_sense_score0 or more.txt"),
+  u1_summary = file.path(data_dir, "u1_summary_down500_sense_maxentscore_higherthan0.txt"),
   tissue_expression = file.path(data_dir, "rna_tissue_consensus.tsv")
 )
 
@@ -84,7 +84,7 @@ number_prediction_bins <- 10L
 # Prepare U1SS features
 
 For each gene, the mean score and distance are calculated from the five nearest
-U1 sites. The number of downstream sense-oriented U1 sites within 1 kb is taken
+U1 sites. The number of downstream sense-oriented U1 sites within 500 bp is taken
 from the U1SS summary table.
 
 ```{r prepare-u1-features}
