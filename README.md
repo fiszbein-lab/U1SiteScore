@@ -159,27 +159,12 @@ U1SS_RESULTS_DIR=results \
 Rscript -e 'rmarkdown::render("U1site-distribution-whole-genome.Rmd")'
 ```
 
-Outputs written to `results/`:
-
-- `u1ss_density_by_genomic_region.tsv`
-- `u1ss_density_by_genomic_region.pdf`
 
 This analysis uses chromosomes 1–22, X, and Y; transcripts with at least five
 annotated exons; five non-overlapping 1-kb promoter bins; exon and intron ranks
 1–4; later exons and introns; and strand-matched distal intergenic sequence.
 
-## Reproducibility notes
-
-- All genomic coordinates supplied to the R scripts are expected to be
-  one-based and closed. bedGraph output uses zero-based, half-open intervals.
-- Chromosome naming must agree among each analysis's annotation and score-track
-  files.
-- The nearest-site analysis is strand-specific.
-- Missing tissue-expression measurements are assigned an `nTPM` of zero in the
-  GAM, matching the published analysis.
-- Each R Markdown report ends with `sessionInfo()` to record package versions.
 
 ## Citation
 
-If you use this repository, please cite the associated publication. Full
-citation information can be added here when the article is published.
+If you use this repository, please cite [Kim et al., 2026]. DOI to be added.
