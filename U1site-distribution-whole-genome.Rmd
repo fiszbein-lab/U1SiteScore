@@ -1,0 +1,586 @@
+---
+title: "Genome-wide distribution of U1 splice-site scores"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+This document quantifies strand-matched U1 splice-site score (U1SS) intervals
+across promoter, exon, intron, and distal intergenic regions on the human
+autosomes and sex chromosomes. Genes with at least five annotated exons are
+included so that exon and intron ranks 1--4 can be compared with later ranks.
+
+Expected input files in `data/`:
+
+- `all_GENCODE_basic.tsv`: transcript and exon coordinates.
+- `map_5ss_hg38_single_nt_plus_corrected.bw`: plus-strand U1SS scores.
+- `map_5ss_hg38_single_nt_minus_corrected.bw`: minus-strand U1SS scores.
+
+Set `U1SS_DATA_DIR` or `U1SS_RESULTS_DIR` to use different input or output
+directories.
+
+```{r setup, include=FALSE}
+required_packages <- c(
+  "dplyr",
+  "GenomeInfoDb",
+  "GenomicRanges",
+  "ggplot2",
+  "IRanges",
+  "knitr",
+  "rtracklayer",
+  "S4Vectors"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following required package(s): ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+data_dir <- Sys.getenv("U1SS_DATA_DIR", unset = "data")
+results_dir <- Sys.getenv("U1SS_RESULTS_DIR", unset = "results")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+input_files <- c(
+  annotation = file.path(data_dir, "all_GENCODE_basic.tsv"),
+  plus_bigwig = file.path(
+    data_dir,
+    "map_5ss_hg38_single_nt_plus_corrected.bw"
+  ),
+  minus_bigwig = file.path(
+    data_dir,
+    "map_5ss_hg38_single_nt_minus_corrected.bw"
+  )
+)
+
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files) > 0L) {
+  stop(
+    "The following input file(s) were not found: ",
+    paste(missing_files, collapse = ", ")
+  )
+}
+
+primary_chromosomes <- c(as.character(seq_len(22L)), "X", "Y")
+minimum_exon_count <- 5L
+promoter_bin_width <- 1000L
+number_promoter_bins <- 5L
+```
+
+# Import and validate the U1SS tracks
+
+The two bigWig files are explicitly assigned their corresponding strands.
+Mitochondrial and non-primary contigs are excluded from both the numerator and
+denominator of all density estimates.
+
+```{r import-u1ss}
+u1ss_plus <- rtracklayer::import(
+  input_files[["plus_bigwig"]],
+  format = "BigWig"
+)
+u1ss_minus <- rtracklayer::import(
+  input_files[["minus_bigwig"]],
+  format = "BigWig"
+)
+
+plus_lengths <- GenomeInfoDb::seqlengths(u1ss_plus)[primary_chromosomes]
+minus_lengths <- GenomeInfoDb::seqlengths(u1ss_minus)[primary_chromosomes]
+
+if (any(is.na(plus_lengths)) || any(is.na(minus_lengths))) {
+  stop("Both U1SS tracks must contain all chromosomes 1--22, X, and Y.")
+}
+if (!identical(as.numeric(plus_lengths), as.numeric(minus_lengths))) {
+  stop("The plus- and minus-strand bigWig chromosome lengths do not match.")
+}
+
+genome_lengths <- stats::setNames(as.numeric(plus_lengths), primary_chromosomes)
+primary_seqinfo <- GenomeInfoDb::Seqinfo(
+  seqnames = primary_chromosomes,
+  seqlengths = genome_lengths
+)
+
+u1ss_plus <- GenomeInfoDb::keepSeqlevels(
+  u1ss_plus,
+  primary_chromosomes,
+  pruning.mode = "coarse"
+)
+u1ss_minus <- GenomeInfoDb::keepSeqlevels(
+  u1ss_minus,
+  primary_chromosomes,
+  pruning.mode = "coarse"
+)
+GenomicRanges::strand(u1ss_plus) <- "+"
+GenomicRanges::strand(u1ss_minus) <- "-"
+u1_sites <- c(u1ss_plus, u1ss_minus)
+
+if (length(u1_sites) == 0L) {
+  stop("The U1SS tracks contain no intervals on the primary chromosomes.")
+}
+if (!"score" %in% names(S4Vectors::mcols(u1_sites))) {
+  stop("The U1SS bigWig intervals must contain a `score` column.")
+}
+if (any(!is.finite(as.numeric(S4Vectors::mcols(u1_sites)$score)))) {
+  stop("The U1SS tracks contain missing or non-numeric scores.")
+}
+
+cat("Strand-specific U1SS intervals:", length(u1_sites), "\n")
+```
+
+# Prepare transcript, exon, and intron annotations
+
+Introns are constructed separately within each transcript. This prevents
+overlapping transcripts from merging or subtracting one another.
+
+```{r prepare-annotation}
+annotation_raw <- utils::read.delim(
+  input_files[["annotation"]],
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+required_annotation_columns <- c(
+  "Gene.ID.version",
+  "gene_name",
+  "chr",
+  "exon_start",
+  "exon_end",
+  "Exon_rank",
+  "transcript_start",
+  "transcript_end",
+  "strand"
+)
+if (!all(required_annotation_columns %in% names(annotation_raw))) {
+  stop(
+    "The annotation file must contain the columns: ",
+    paste(required_annotation_columns, collapse = ", ")
+  )
+}
+
+annotation <- annotation_raw |>
+  dplyr::transmute(
+    transcript_id = as.character(.data[["Gene.ID.version"]]),
+    gene_name = as.character(.data$gene_name),
+    chromosome = as.character(.data$chr),
+    exon_start = as.integer(.data$exon_start),
+    exon_end = as.integer(.data$exon_end),
+    exon_rank = as.integer(.data$Exon_rank),
+    transcript_start = as.integer(.data$transcript_start),
+    transcript_end = as.integer(.data$transcript_end),
+    strand = as.character(.data$strand)
+  ) |>
+  dplyr::filter(
+    nzchar(.data$transcript_id),
+    .data$chromosome %in% primary_chromosomes
+  )
+
+coordinate_columns <- c(
+  "exon_start", "exon_end", "exon_rank",
+  "transcript_start", "transcript_end"
+)
+if (any(!stats::complete.cases(annotation[, coordinate_columns]))) {
+  stop("The annotation contains missing or non-integer coordinates or ranks.")
+}
+if (any(!annotation$strand %in% c("+", "-"))) {
+  stop("Annotation strand values must be `+` or `-`.")
+}
+if (any(annotation$exon_start < 1L) ||
+    any(annotation$exon_end < annotation$exon_start) ||
+    any(annotation$transcript_start < 1L) ||
+    any(annotation$transcript_end < annotation$transcript_start)) {
+  stop("The annotation contains invalid genomic coordinates.")
+}
+if (any(annotation$exon_start < annotation$transcript_start) ||
+    any(annotation$exon_end > annotation$transcript_end)) {
+  stop("One or more exons extend beyond their transcript coordinates.")
+}
+
+chromosome_limit <- genome_lengths[annotation$chromosome]
+if (any(annotation$exon_end > chromosome_limit) ||
+    any(annotation$transcript_end > chromosome_limit)) {
+  stop("Annotation coordinates extend beyond the bigWig chromosome lengths.")
+}
+
+duplicate_exons <- duplicated(
+  annotation[, c("transcript_id", "exon_start", "exon_end")]
+)
+if (any(duplicate_exons)) {
+  stop("The annotation contains duplicated exon coordinates within a transcript.")
+}
+
+transcript_consistency <- annotation |>
+  dplyr::group_by(.data$transcript_id) |>
+  dplyr::summarise(
+    chromosomes = dplyr::n_distinct(.data$chromosome),
+    strands = dplyr::n_distinct(.data$strand),
+    starts = dplyr::n_distinct(.data$transcript_start),
+    ends = dplyr::n_distinct(.data$transcript_end),
+    .groups = "drop"
+  )
+if (any(transcript_consistency$chromosomes != 1L) ||
+    any(transcript_consistency$strands != 1L) ||
+    any(transcript_consistency$starts != 1L) ||
+    any(transcript_consistency$ends != 1L)) {
+  stop("Each transcript must have one chromosome, strand, start, and end.")
+}
+
+annotation <- annotation |>
+  dplyr::group_by(.data$transcript_id) |>
+  dplyr::filter(dplyr::n() >= minimum_exon_count) |>
+  dplyr::ungroup()
+
+if (nrow(annotation) == 0L) {
+  stop("No transcripts met the minimum exon-count requirement.")
+}
+
+rank_is_valid <- vapply(
+  split(annotation$exon_rank, annotation$transcript_id),
+  function(ranks) {
+    identical(sort(ranks), seq_len(length(ranks)))
+  },
+  logical(1)
+)
+if (any(!rank_is_valid)) {
+  stop(
+    "Exon ranks must be unique and consecutive within each transcript. ",
+    "Invalid transcript(s): ",
+    paste(utils::head(names(rank_is_valid)[!rank_is_valid], 10L), collapse = ", ")
+  )
+}
+
+transcript_table <- annotation |>
+  dplyr::distinct(
+    .data$transcript_id,
+    .data$gene_name,
+    .data$chromosome,
+    .data$transcript_start,
+    .data$transcript_end,
+    .data$strand
+  )
+
+if (anyDuplicated(transcript_table$transcript_id)) {
+  stop("Transcript identifiers are not unique after annotation validation.")
+}
+
+transcript_ranges <- GenomicRanges::makeGRangesFromDataFrame(
+  transcript_table,
+  seqnames.field = "chromosome",
+  start.field = "transcript_start",
+  end.field = "transcript_end",
+  strand.field = "strand",
+  keep.extra.columns = TRUE
+)
+GenomeInfoDb::seqinfo(transcript_ranges) <-
+  primary_seqinfo[GenomeInfoDb::seqlevels(transcript_ranges)]
+
+make_transcript_introns <- function(exons) {
+  exons <- exons[order(exons$exon_start, exons$exon_end), , drop = FALSE]
+  intron_start <- utils::head(exons$exon_end, -1L) + 1L
+  intron_end <- utils::tail(exons$exon_start, -1L) - 1L
+
+  if (any(intron_end < intron_start)) {
+    stop(
+      "Overlapping or out-of-order exons were found in transcript: ",
+      exons$transcript_id[[1L]]
+    )
+  }
+
+  number_introns <- length(intron_start)
+  intron_rank <- seq_len(number_introns)
+  if (exons$strand[[1L]] == "-") {
+    intron_rank <- rev(intron_rank)
+  }
+
+  data.frame(
+    transcript_id = exons$transcript_id[[1L]],
+    chromosome = exons$chromosome[[1L]],
+    start = intron_start,
+    end = intron_end,
+    strand = exons$strand[[1L]],
+    intron_rank = intron_rank,
+    stringsAsFactors = FALSE
+  )
+}
+
+intron_table <- dplyr::bind_rows(lapply(
+  split(annotation, annotation$transcript_id),
+  make_transcript_introns
+))
+
+make_ranges <- function(data, start_column, end_column) {
+  ranges <- GenomicRanges::makeGRangesFromDataFrame(
+    data,
+    seqnames.field = "chromosome",
+    start.field = start_column,
+    end.field = end_column,
+    strand.field = "strand",
+    keep.extra.columns = FALSE
+  )
+  GenomeInfoDb::seqinfo(ranges) <-
+    primary_seqinfo[GenomeInfoDb::seqlevels(ranges)]
+  ranges
+}
+
+make_exon_rank_ranges <- function(rank_value = NULL, later_than = NULL) {
+  selected <- if (!is.null(rank_value)) {
+    annotation[annotation$exon_rank == rank_value, , drop = FALSE]
+  } else {
+    annotation[annotation$exon_rank > later_than, , drop = FALSE]
+  }
+  make_ranges(selected, "exon_start", "exon_end")
+}
+
+make_intron_rank_ranges <- function(rank_value = NULL, later_than = NULL) {
+  selected <- if (!is.null(rank_value)) {
+    intron_table[intron_table$intron_rank == rank_value, , drop = FALSE]
+  } else {
+    intron_table[intron_table$intron_rank > later_than, , drop = FALSE]
+  }
+  make_ranges(selected, "start", "end")
+}
+
+cat("Transcripts retained:", nrow(transcript_table), "\n")
+cat("Exons retained:", nrow(annotation), "\n")
+cat("Introns constructed:", nrow(intron_table), "\n")
+```
+
+# Define genomic regions
+
+Promoter bins are non-overlapping 1-kb intervals upstream of each transcript.
+Coordinates are clipped to chromosome boundaries. Distal intergenic sequence is
+defined separately on each strand after excluding transcripts and their 5-kb
+upstream regions.
+
+```{r define-regions}
+make_promoter_bin <- function(transcripts, bin_number, bin_width) {
+  transcript_strand <- as.character(GenomicRanges::strand(transcripts))
+  tss <- ifelse(
+    transcript_strand == "+",
+    GenomicRanges::start(transcripts),
+    GenomicRanges::end(transcripts)
+  )
+
+  region_start <- ifelse(
+    transcript_strand == "+",
+    tss - bin_number * bin_width,
+    tss + (bin_number - 1L) * bin_width + 1L
+  )
+  region_end <- ifelse(
+    transcript_strand == "+",
+    tss - (bin_number - 1L) * bin_width - 1L,
+    tss + bin_number * bin_width
+  )
+
+  chromosome <- as.character(GenomicRanges::seqnames(transcripts))
+  region_start <- pmax(1, region_start)
+  region_end <- pmin(genome_lengths[chromosome], region_end)
+  valid <- region_start <= region_end
+
+  ranges <- GenomicRanges::GRanges(
+    seqnames = chromosome[valid],
+    ranges = IRanges::IRanges(
+      start = region_start[valid],
+      end = region_end[valid]
+    ),
+    strand = transcript_strand[valid]
+  )
+  GenomeInfoDb::seqinfo(ranges) <-
+    primary_seqinfo[GenomeInfoDb::seqlevels(ranges)]
+  ranges
+}
+
+promoter_bins <- lapply(
+  seq_len(number_promoter_bins),
+  make_promoter_bin,
+  transcripts = transcript_ranges,
+  bin_width = promoter_bin_width
+)
+
+whole_genome <- GenomicRanges::GRanges(
+  seqnames = rep(primary_chromosomes, times = 2L),
+  ranges = IRanges::IRanges(
+    start = 1L,
+    end = rep(genome_lengths, times = 2L)
+  ),
+  strand = rep(c("+", "-"), each = length(primary_chromosomes)),
+  seqinfo = primary_seqinfo
+)
+
+# `make_promoter_bin()` defines one selected bin. For the complete 5-kb
+# promoter, combine the five adjacent 1-kb bins before reducing overlaps.
+promoter_5kb <- GenomicRanges::reduce(
+  do.call(c, promoter_bins),
+  ignore.strand = FALSE
+)
+genic_and_promoter_ranges <- GenomicRanges::reduce(
+  c(transcript_ranges, promoter_5kb),
+  ignore.strand = FALSE
+)
+distal_intergenic <- GenomicRanges::setdiff(
+  whole_genome,
+  genic_and_promoter_ranges,
+  ignore.strand = FALSE
+)
+
+region_ranges <- list(
+  "Promoter (<=1 kb)" = promoter_bins[[1L]],
+  "Promoter (1-2 kb)" = promoter_bins[[2L]],
+  "Promoter (2-3 kb)" = promoter_bins[[3L]],
+  "Promoter (3-4 kb)" = promoter_bins[[4L]],
+  "Promoter (4-5 kb)" = promoter_bins[[5L]],
+  "1st Exon" = make_exon_rank_ranges(rank_value = 1L),
+  "2nd Exon" = make_exon_rank_ranges(rank_value = 2L),
+  "3rd Exon" = make_exon_rank_ranges(rank_value = 3L),
+  "4th Exon" = make_exon_rank_ranges(rank_value = 4L),
+  "Other Exons" = make_exon_rank_ranges(later_than = 4L),
+  "1st Intron" = make_intron_rank_ranges(rank_value = 1L),
+  "2nd Intron" = make_intron_rank_ranges(rank_value = 2L),
+  "3rd Intron" = make_intron_rank_ranges(rank_value = 3L),
+  "4th Intron" = make_intron_rank_ranges(rank_value = 4L),
+  "Other Introns" = make_intron_rank_ranges(later_than = 4L),
+  "Distal Intergenic" = distal_intergenic
+)
+
+empty_regions <- names(region_ranges)[lengths(region_ranges) == 0L]
+if (length(empty_regions) > 0L) {
+  stop("No intervals were available for: ", paste(empty_regions, collapse = ", "))
+}
+```
+
+# Calculate U1SS density
+
+Each U1SS interval is counted once for every annotated region it overlaps. The
+denominator is the corresponding sum of annotated base pairs, so densities are
+annotation-weighted when transcripts overlap.
+
+```{r calculate-density}
+summarize_region <- function(region_name, ranges, sites) {
+  site_count <- sum(GenomicRanges::countOverlaps(
+    ranges,
+    sites,
+    ignore.strand = FALSE
+  ))
+  region_size <- sum(IRanges::width(ranges))
+
+  data.frame(
+    Region = region_name,
+    U1SS_count = site_count,
+    Region_size_bp = region_size,
+    U1SS_density_per_bp = site_count / region_size,
+    stringsAsFactors = FALSE
+  )
+}
+
+density_table <- dplyr::bind_rows(Map(
+  summarize_region,
+  names(region_ranges),
+  region_ranges,
+  MoreArgs = list(sites = u1_sites)
+))
+
+region_order <- c(
+  "Distal Intergenic",
+  "Promoter (4-5 kb)",
+  "Promoter (3-4 kb)",
+  "Promoter (2-3 kb)",
+  "Promoter (1-2 kb)",
+  "Promoter (<=1 kb)",
+  "1st Exon",
+  "1st Intron",
+  "2nd Exon",
+  "2nd Intron",
+  "3rd Exon",
+  "3rd Intron",
+  "4th Exon",
+  "4th Intron",
+  "Other Exons",
+  "Other Introns"
+)
+
+density_table <- density_table |>
+  dplyr::mutate(Region = factor(.data$Region, levels = region_order)) |>
+  dplyr::arrange(.data$Region)
+
+knitr::kable(density_table, digits = 6)
+```
+
+# Plot and save results
+
+```{r plot-density}
+region_colors <- c(
+  "gray20",
+  "rosybrown4", "rosybrown", "rosybrown3", "rosybrown2", "rosybrown1",
+  "skyblue1", "navajowhite1",
+  "skyblue2", "navajowhite2",
+  "skyblue3", "navajowhite3",
+  "skyblue4", "navajowhite4",
+  "steelblue4", "lightgoldenrod4"
+)
+
+density_plot <- ggplot2::ggplot(
+  density_table,
+  ggplot2::aes(
+    x = .data$Region,
+    y = .data$U1SS_density_per_bp,
+    fill = .data$Region
+  )
+) +
+  ggplot2::geom_col(width = 0.8) +
+  ggplot2::scale_fill_manual(values = region_colors, guide = "none") +
+  ggplot2::labs(
+    x = NULL,
+    y = "U1SS density (sites per bp)"
+  ) +
+  ggplot2::theme_classic(base_size = 12) +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    )
+  )
+
+density_plot
+```
+
+```{r save-results}
+output_table <- density_table |>
+  dplyr::mutate(Region = as.character(.data$Region))
+
+utils::write.table(
+  output_table,
+  file = file.path(results_dir, "u1ss_density_by_genomic_region.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    results_dir,
+    "u1ss_density_by_genomic_region.pdf"
+  ),
+  plot = density_plot,
+  width = 8,
+  height = 5,
+  units = "in"
+)
+```
+
+# Session information
+
+```{r session-information}
+sessionInfo()
+```

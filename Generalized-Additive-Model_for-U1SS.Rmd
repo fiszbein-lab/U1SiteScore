@@ -1,0 +1,382 @@
+---
+title: "Generalized additive model of gene expression from U1 snRNP binding-site features"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+This document reproduces the generalized additive model (GAM) analysis used to
+relate U1 snRNP binding-site (U1SS) features to mean gene expression across ten
+human tissues. Input paths are relative to the project directory so that the
+analysis can be shared without user-specific filesystem paths.
+
+Expected input files in `data/`:
+
+- `nearest_10_U1_sites_by_gene.RData`: the output from
+  `Find_top-n_nearest_U1sites_publication.R`, containing
+  `nearest_U1sitelist`.
+- `down1000_sense_score0 or more.txt`: tab-delimited U1SS summary data.
+- `rna_tissue_consensus.tsv`: Human Protein Atlas tissue-expression data.
+
+Set the `U1SS_DATA_DIR` or `U1SS_RESULTS_DIR` environment variable to use a
+different input or output directory, respectively.
+
+```{r setup, include=FALSE}
+required_packages <- c("dplyr", "ggplot2", "knitr", "mgcv")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Install the following required package(s): ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+
+data_dir <- Sys.getenv("U1SS_DATA_DIR", unset = "data")
+results_dir <- Sys.getenv("U1SS_RESULTS_DIR", unset = "results")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+input_files <- c(
+  nearest_u1_sites = file.path(data_dir, "nearest_10_U1_sites_by_gene.RData"),
+  u1_summary = file.path(data_dir, "down1000_sense_score0 or more.txt"),
+  tissue_expression = file.path(data_dir, "rna_tissue_consensus.tsv")
+)
+
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files) > 0L) {
+  stop(
+    "The following input file(s) were not found: ",
+    paste(missing_files, collapse = ", ")
+  )
+}
+
+selected_tissues <- c(
+  "cerebral cortex",
+  "heart muscle",
+  "liver",
+  "kidney",
+  "lung",
+  "spleen",
+  "skin",
+  "adipose tissue",
+  "ovary",
+  "small intestine"
+)
+
+number_nearest_sites <- 5L
+expression_upper_quantile <- 0.95
+training_sample_size <- 10000L
+training_seed <- 321L
+number_prediction_bins <- 10L
+```
+
+# Prepare U1SS features
+
+For each gene, the mean score and distance are calculated from the five nearest
+U1 sites. The number of downstream sense-oriented U1 sites within 1 kb is taken
+from the U1SS summary table.
+
+```{r prepare-u1-features}
+u1_environment <- new.env(parent = baseenv())
+loaded_objects <- load(input_files[["nearest_u1_sites"]], envir = u1_environment)
+
+if (!"nearest_U1sitelist" %in% loaded_objects) {
+  stop("The nearest-site file must contain an object named `nearest_U1sitelist`.")
+}
+
+nearest_u1_site_list <- get("nearest_U1sitelist", envir = u1_environment)
+
+required_nearest_columns <- c("gene", "u1_score", "distance")
+invalid_entries <- which(!vapply(
+  nearest_u1_site_list,
+  function(x) {
+    is.data.frame(x) &&
+      all(required_nearest_columns %in% names(x)) &&
+      nrow(x) >= number_nearest_sites
+  },
+  logical(1)
+))
+
+if (length(invalid_entries) > 0L) {
+  stop(
+    "Every element of `nearest_U1sitelist` must contain at least ",
+    number_nearest_sites,
+    " rows and the columns: ",
+    paste(required_nearest_columns, collapse = ", "),
+    ". Invalid element(s): ",
+    paste(utils::head(invalid_entries, 10L), collapse = ", ")
+  )
+}
+
+summarize_nearest_sites <- function(site_table, n_sites) {
+  nearest_sites <- utils::head(site_table, n_sites)
+
+  data.frame(
+    gene = as.character(nearest_sites$gene[[1L]]),
+    mean_score = mean(as.numeric(nearest_sites$u1_score), na.rm = TRUE),
+    mean_dist = mean(as.numeric(nearest_sites$distance), na.rm = TRUE),
+    stringsAsFactors = FALSE
+  )
+}
+
+nearest_u1_summary <- dplyr::bind_rows(lapply(
+  nearest_u1_site_list,
+  summarize_nearest_sites,
+  n_sites = number_nearest_sites
+)) |>
+  dplyr::filter(nzchar(.data$gene))
+
+if (any(!is.finite(nearest_u1_summary$mean_score)) ||
+    any(!is.finite(nearest_u1_summary$mean_dist))) {
+  stop("Non-finite mean U1SS scores or distances were found.")
+}
+
+if (anyDuplicated(nearest_u1_summary$gene)) {
+  stop("Nearest-site data contain duplicated non-empty gene symbols.")
+}
+
+u1_summary_raw <- utils::read.delim(
+  input_files[["u1_summary"]],
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+required_u1_columns <- c("gene", "name", "num_u1")
+if (!all(required_u1_columns %in% names(u1_summary_raw))) {
+  stop(
+    "The U1SS summary file must contain the columns: ",
+    paste(required_u1_columns, collapse = ", ")
+  )
+}
+
+u1_counts <- u1_summary_raw |>
+  dplyr::transmute(
+    ens = as.character(.data$gene),
+    gene = as.character(.data$name),
+    num_u1 = as.numeric(.data$num_u1)
+  ) |>
+  dplyr::filter(nzchar(.data$gene))
+
+if (any(!is.finite(u1_counts$num_u1))) {
+  stop("The `num_u1` column contains missing or non-numeric values.")
+}
+
+if (anyDuplicated(u1_counts$gene)) {
+  stop("The U1SS summary contains duplicated non-empty gene symbols.")
+}
+
+u1_features <- nearest_u1_summary |>
+  dplyr::inner_join(u1_counts, by = "gene") |>
+  dplyr::select("ens", "gene", "num_u1", "mean_score", "mean_dist")
+
+if (anyDuplicated(u1_features$ens)) {
+  stop("U1SS feature data contain duplicated Ensembl gene identifiers.")
+}
+
+knitr::kable(utils::head(u1_features), digits = 3)
+```
+
+# Prepare mean tissue expression
+
+Normalized transcript abundance (`nTPM`) is averaged across the ten tissues
+listed in the setup section. Genes without a matching expression measurement
+are assigned an `nTPM` of zero, consistent with the original analysis.
+
+```{r prepare-expression}
+tissue_expression_raw <- utils::read.delim(
+  input_files[["tissue_expression"]],
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+required_expression_columns <- c("Gene", "Gene name", "Tissue", "nTPM")
+if (!all(required_expression_columns %in% names(tissue_expression_raw))) {
+  stop(
+    "The tissue-expression file must contain the columns: ",
+    paste(required_expression_columns, collapse = ", ")
+  )
+}
+
+mean_tissue_expression <- tissue_expression_raw |>
+  dplyr::filter(.data$Tissue %in% selected_tissues) |>
+  dplyr::transmute(
+    ens = as.character(.data$Gene),
+    gene = as.character(.data[["Gene name"]]),
+    nTPM = as.numeric(.data$nTPM)
+  ) |>
+  dplyr::group_by(.data$ens, .data$gene) |>
+  dplyr::summarise(nTPM = mean(.data$nTPM, na.rm = TRUE), .groups = "drop")
+
+observed_tissues <- unique(tissue_expression_raw$Tissue)
+missing_tissues <- setdiff(selected_tissues, observed_tissues)
+if (length(missing_tissues) > 0L) {
+  stop(
+    "The following selected tissue(s) are absent from the expression file: ",
+    paste(missing_tissues, collapse = ", ")
+  )
+}
+
+analysis_data <- u1_features |>
+  dplyr::left_join(mean_tissue_expression, by = c("ens", "gene")) |>
+  dplyr::mutate(nTPM = dplyr::coalesce(.data$nTPM, 0))
+
+if (any(!is.finite(analysis_data$nTPM)) || any(analysis_data$nTPM < 0)) {
+  stop("Expression values must be finite and non-negative.")
+}
+
+expression_cutoff <- stats::quantile(
+  analysis_data$nTPM,
+  probs = expression_upper_quantile,
+  names = FALSE,
+  na.rm = TRUE
+)
+
+analysis_data <- analysis_data |>
+  dplyr::filter(.data$nTPM <= expression_cutoff)
+
+if (nrow(analysis_data) < training_sample_size) {
+  stop(
+    "Only ", nrow(analysis_data),
+    " genes remain after filtering; at least ", training_sample_size,
+    " are required for the training sample."
+  )
+}
+
+cat("Expression cutoff (95th percentile):", expression_cutoff, "nTPM\n")
+cat("Genes retained for analysis:", nrow(analysis_data), "\n")
+```
+
+# Fit the generalized additive model
+
+The training set comprises 10,000 genes selected with a fixed random seed. A
+negative-binomial GAM with a log link models mean expression using smooth terms
+for U1SS count, mean score, and mean distance.
+
+```{r fit-gam}
+set.seed(training_seed)
+training_rows <- sample.int(nrow(analysis_data), size = training_sample_size)
+
+analysis_data <- analysis_data |>
+  dplyr::mutate(
+    data_partition = ifelse(
+      dplyr::row_number() %in% training_rows,
+      "training",
+      "held-out"
+    )
+  )
+
+training_data <- analysis_data[training_rows, , drop = FALSE]
+
+gam_model <- mgcv::gam(
+  nTPM ~ s(num_u1) + s(mean_score) + s(mean_dist),
+  data = training_data,
+  family = mgcv::nb(link = "log")
+)
+
+summary(gam_model)
+```
+
+```{r gam-smooths}
+plot(gam_model, pages = 1, se = TRUE, shade = TRUE)
+```
+
+```{r gam-diagnostics}
+set.seed(training_seed)
+mgcv::gam.check(gam_model)
+```
+
+# Predict expression and assign prediction deciles
+
+Predictions are generated for both training and held-out genes. Genes are then
+divided into ten equally sized groups according to predicted expression; bin 1
+contains the lowest predictions and bin 10 contains the highest.
+
+```{r predict-and-bin}
+analysis_data <- analysis_data |>
+  dplyr::mutate(
+    predicted_nTPM = as.numeric(stats::predict(
+      gam_model,
+      newdata = analysis_data,
+      type = "response"
+    )),
+    U1SS_bin = dplyr::ntile(.data$predicted_nTPM, number_prediction_bins)
+  )
+
+prediction_plot <- ggplot2::ggplot(
+  analysis_data,
+  ggplot2::aes(
+    x = factor(.data$U1SS_bin, levels = seq_len(number_prediction_bins)),
+    y = log10(.data$nTPM + 1),
+    fill = factor(.data$U1SS_bin)
+  )
+) +
+  ggplot2::geom_boxplot(notch = TRUE, outlier.size = 0.4) +
+  ggplot2::labs(
+    x = "Predicted expression decile",
+    y = expression(log[10](nTPM + 1))
+  ) +
+  ggplot2::guides(fill = "none") +
+  ggplot2::theme_classic(base_size = 12)
+
+prediction_plot
+```
+
+# Save reproducibility outputs
+
+```{r save-results}
+prediction_table <- analysis_data |>
+  dplyr::select(
+    "ens",
+    "gene",
+    "nTPM",
+    "num_u1",
+    "mean_score",
+    "mean_dist",
+    "data_partition",
+    "predicted_nTPM",
+    "U1SS_bin"
+  ) |>
+  dplyr::arrange(.data$U1SS_bin, .data$predicted_nTPM)
+
+utils::write.table(
+  prediction_table,
+  file = file.path(results_dir, "gam_gene_predictions.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+ggplot2::ggsave(
+  filename = file.path(
+    results_dir,
+    "gam_observed_expression_by_prediction_decile.pdf"
+  ),
+  plot = prediction_plot,
+  width = 7,
+  height = 5,
+  units = "in"
+)
+
+saveRDS(gam_model, file.path(results_dir, "gam_model.rds"))
+writeLines(
+  capture.output(summary(gam_model)),
+  file.path(results_dir, "gam_model_summary.txt")
+)
+```
+
+# Session information
+
+```{r session-information}
+sessionInfo()
+```
