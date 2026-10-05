@@ -59,9 +59,6 @@ following additional file:
 | --- | --- |
 | `rna_tissue_consensus.tsv` | Human Protein Atlas tissue-expression table containing `Gene`, `Gene name`, `Tissue`, and `nTPM`. |
 
-Place `rna_tissue_consensus.tsv` in the repository root. Alternatively, set
-`U1SS_DATA_DIR` to the directory containing all three GAM input files.
-
 Recreating all processed U1SS inputs from their upstream sources additionally
 requires:
 
@@ -100,6 +97,9 @@ python map_5ss_to_genome_single_nt.py \
 The outputs are `results/map_5ss_hg38_plus.bg` and
 `results/map_5ss_hg38_minus.bg`. Conversion to indexed bigWig tracks is an
 external preprocessing step and is not performed by this script.
+
+*Resulting strand-specific U1 binding site score tracks can be explored in this UCSC Genome Browser tracks:
+  [U1 binding site score tracks](https://genome.ucsc.edu/s/GyeungYun/5SpliceSiteScore)
 
 ### 2. Find the nearest U1SS intervals
 
