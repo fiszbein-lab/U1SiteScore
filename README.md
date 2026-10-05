@@ -8,7 +8,7 @@ The scripts in this repository accompany the associated journal publication.
 
 | File | Description |
 | --- | --- |
-| `map_5ss_to_genome.py` | Maps 9-mer 5′ splice-site scores across a reference genome and writes strand-specific bedGraph tracks. |
+| `map_5ss_to_genome_single_nt.py` | Maps strand-oriented 9-mer 5′ splice-site scores at single-nucleotide resolution and writes strand-specific bedGraph tracks. |
 | `Find_top-n_nearest_U1sites.R` | Identifies the nearest strand-matched U1SS intervals for each protein-coding gene transcription start site. |
 | `Generalized-Additive-Model_for-U1SS.Rmd` | Fits the negative-binomial generalized additive model relating U1SS features to mean expression across ten human tissues. |
 | `U1site-distribution-whole-genome.Rmd` | Calculates U1SS density in promoter, exon, intron, and distal intergenic regions. |
@@ -67,8 +67,8 @@ requires:
 
 | Input | Used by |
 | --- | --- |
-| Reference-genome FASTA | `map_5ss_to_genome.py` |
-| Two-column table of 9-mer sequences and scores | `map_5ss_to_genome.py` |
+| Reference-genome FASTA | `map_5ss_to_genome_single_nt.py` |
+| Two-column table of 9-mer sequences and scores | `map_5ss_to_genome_single_nt.py` |
 | Plus- and minus-strand U1SS bigWig tracks | Both R-based genomic analyses |
 | Protein-coding gene TSS table with `chr`, `TSS`, `strand`, and `gene_name` | `Find_top-n_nearest_U1sites.R` |
 | GENCODE exon/transcript table described below | `U1site-distribution-whole-genome.Rmd` |
@@ -83,18 +83,18 @@ variables and report missing inputs before beginning an analysis.
 
 ## Analysis workflow
 
-### 1. Map 9-mer scores across the genome
+### 1. Map 9-mer scores at single-nucleotide resolution
 
-This optional upstream step creates plus- and minus-strand bedGraph files:
+This optional upstream step assigns a strand-oriented 9-mer score at each
+genomic position and creates plus- and minus-strand bedGraph files:
 
 ```bash
-python map_5ss_to_genome.py \
+python map_5ss_to_genome_single_nt.py \
   --fasta /path/to/reference.fa \
   --scores /path/to/u1ss_9mer_scores.tsv \
-  --output-prefix results/map_5ss_hg38 \
-  --workers 8 \
-  --window-size 100 \
-  --step-size 10
+  --outname results/map_5ss_hg38_single_nt \
+  --num_threads 8 \
+  --bin 1
 ```
 
 The outputs are `results/map_5ss_hg38_plus.bg` and
